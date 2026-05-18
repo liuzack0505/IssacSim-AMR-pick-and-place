@@ -9,6 +9,7 @@ To run the project in Isaac Sim:
 3. Load `exec.py` in the Script Editor.
 4. Click the Run button to start the simulation task.
 5. After one simulation round finishes, click the Run button again to reset and start another round. 
+6. I didn't enable Physics Collider visualization in the video, since my computer would lag a lot if I enable it.
 
 ## Setup Screenshot
 ![alt text](images/image.png)

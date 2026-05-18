@@ -38,9 +38,8 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Scene asset paths
 # -----------------------------------------------------------------------------
-SCENE_USD_PATH = r"C:\Users\user\NTHU\digital_twin\dataset\midterm\asset\hospital.usd"
-ROBOT_USD_PATH = r"C:\Users\user\NTHU\digital_twin\dataset\midterm\asset\custom_robot.usd"
-
+SCENE_USD_PATH = r"your_hospital.usd"
+ROBOT_USD_PATH = r"your_custom_robot.usd"
 # -----------------------------------------------------------------------------
 # Robot prim paths
 # -----------------------------------------------------------------------------
