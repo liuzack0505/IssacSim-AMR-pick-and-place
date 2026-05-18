@@ -9,12 +9,14 @@ import carb
 import carb.settings
 import numpy as np
 import omni.kit.app
+import omni.usd
+from omni.kit.viewport.utility import get_active_viewport
+from pxr import Gf, UsdGeom
 from isaacsim.core.api.articulations import ArticulationSubset
 from isaacsim.core.api.objects import DynamicCuboid
 from isaacsim.core.prims import SingleArticulation, SingleXFormPrim
 from isaacsim.core.utils.rotations import euler_angles_to_quat, quat_to_euler_angles
 from isaacsim.core.utils.stage import add_reference_to_stage
-from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.examples.interactive.base_sample import BaseSample
 from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
 from isaacsim.robot_motion.motion_generation.interface_config_loader import load_supported_lula_kinematics_solver_config
@@ -42,6 +44,9 @@ ROBOT_ARTICULATION_PRIM_PATH = ROBOT_PRIM_PATH + "/nova_carter"
 CHASSIS_PRIM_PATH = ROBOT_ARTICULATION_PRIM_PATH + "/chassis_link"
 FRANKA_BASE_PRIM_PATH = ROBOT_ARTICULATION_PRIM_PATH + "/franka/panda_link0"
 END_EFFECTOR_PRIM_PATH = ROBOT_ARTICULATION_PRIM_PATH + "/franka/panda_hand"
+ROBOT_CAMERA_PRIM_PATH = CHASSIS_PRIM_PATH + "/rear_follow_camera"
+ROBOT_CAMERA_LOCAL_EYE = np.array([-2, 0.0, 4])
+ROBOT_CAMERA_LOCAL_TARGET = np.array([0.65, 0.0, 0.45])
 ROBOT_INITIAL_POSITION = np.array([6.0, -1.0, 0.0])
 ROBOT_INITIAL_YAW = 0.0
 NAVMESH_MIN_RADIUS = 30
@@ -161,11 +166,6 @@ class HelloWorld(BaseSample):
             color=np.array([0.1, 0.55, 1.0]),
             mass=0.05,
         ))
-        set_camera_view(
-            eye=np.array([3.0, 3.0, 2.2]),
-            target=np.array([0.0, 0.0, 0.5]),
-            camera_prim_path="/OmniverseKit_Persp",
-        )
 
     async def setup_post_load(self):
         world = self.get_world()
@@ -196,6 +196,7 @@ class HelloWorld(BaseSample):
             FRANKA_BASE_PRIM_PATH, name="franka_link0_pose")
         self._ee_prim = SingleXFormPrim(
             END_EFFECTOR_PRIM_PATH, name="panda_hand_pose")
+        self._setup_robot_follow_camera()
 
         self._diff_controller = DifferentialController(
             name="nova_diff", wheel_radius=0.14, wheel_base=0.413)
@@ -278,6 +279,36 @@ class HelloWorld(BaseSample):
             orientation=euler_angles_to_quat(
                 np.array([0.0, 0.0, ROBOT_INITIAL_YAW])),
         )
+
+    def _setup_robot_follow_camera(self):
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            carb.log_warn(
+                "[Camera] Could not get USD stage; robot camera was not created.")
+            return
+
+        camera = UsdGeom.Camera.Define(stage, ROBOT_CAMERA_PRIM_PATH)
+        camera.CreateFocalLengthAttr(18.0)
+        camera.CreateClippingRangeAttr(Gf.Vec2f(0.01, 1000.0))
+
+        camera_xform = UsdGeom.Xformable(camera.GetPrim())
+        camera_xform.ClearXformOpOrder()
+        look_at = Gf.Matrix4d(1.0)
+        look_at.SetLookAt(
+            Gf.Vec3d(*ROBOT_CAMERA_LOCAL_EYE),
+            Gf.Vec3d(*ROBOT_CAMERA_LOCAL_TARGET),
+            Gf.Vec3d(0.0, 0.0, 1.0),
+        )
+        camera_xform.AddTransformOp().Set(look_at.GetInverse())
+
+        viewport = get_active_viewport()
+        if viewport is None:
+            carb.log_warn(
+                "[Camera] Could not get active viewport; robot camera was created but not selected.")
+            return
+        viewport.camera_path = ROBOT_CAMERA_PRIM_PATH
+        carb.log_info(
+            f"[Camera] Active viewport attached to robot camera: {ROBOT_CAMERA_PRIM_PATH}")
 
     def _reset_state_machine(self):
         self._state = PickPlaceState.NAVIGATE_TO_PICK
