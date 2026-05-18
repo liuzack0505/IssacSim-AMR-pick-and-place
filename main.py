@@ -153,7 +153,6 @@ class ArmSegment:
         settle_steps=0,
         ee_tolerance=0.025,
         target_joints=None,
-        label="arm_segment",
         reach_timeout_steps=240,
         trajectory_steps=None,
     ):
@@ -169,7 +168,6 @@ class ArmSegment:
         self.waited = 0
         self.reach_waited = 0
         self.ik_solved = False
-        self.label = label
         self.reach_timeout_steps = reach_timeout_steps
         self.trajectory_steps = trajectory_steps
 
@@ -212,7 +210,6 @@ class HelloWorld(BaseSample):
         self._path = []
         self._waypoint_index = 0
         self._settle_count = 0
-        self._nav_log_counter = 0
         self._arm_segments = []
         self._active_segment = None
         self._holding_object = False
@@ -228,7 +225,6 @@ class HelloWorld(BaseSample):
         self.gripper_closed = 0.005
         self.pre_grasp_height = 0.25
         self.grasp_height_offset = 0.02
-        self.lift_height = 0.25
 
         # Fetch sequence timing
         self.fetch_open_settle_steps = 20
@@ -262,8 +258,6 @@ class HelloWorld(BaseSample):
 
     async def setup_post_load(self):
         world = self.get_world()
-        carb.log_warn(
-            "[Placement] setup_post_load reached; resolving randomized task and robot start.")
         await self._wait_for_scene_assets_loaded()
         await self._bake_navmesh()
         self._randomize_task_positions_from_keywords()
@@ -274,17 +268,15 @@ class HelloWorld(BaseSample):
 
         self._robot_controller = self._robot.get_articulation_controller()
         available_dofs = list(self._robot.dof_names)
-        carb.log_info(f"Robot DOF names: {available_dofs}")
         self._wheel_joint_names = self._resolve_wheel_joint_names(
             available_dofs)
         if len(self._wheel_joint_names) == 2:
             self._wheel_subset = ArticulationSubset(
                 self._robot, self._wheel_joint_names)
-            carb.log_info(f"Using wheel joints: {self._wheel_joint_names}")
         else:
             self._wheel_subset = None
             carb.log_warn(
-                "Could not resolve two wheel joints. Navigation is disabled; check Robot DOF names in the log.")
+                f"Could not resolve two wheel joints from DOFs {available_dofs}. Navigation is disabled.")
         self._arm_subset = ArticulationSubset(self._robot, ARM_JOINT_NAMES)
         self._finger_subset = ArticulationSubset(
             self._robot, FINGER_JOINT_NAMES)
@@ -369,7 +361,7 @@ class HelloWorld(BaseSample):
             return
         orientation = euler_angles_to_quat(
             np.array([0.0, 0.0, self._robot_initial_yaw]))
-        self._apply_robot_root_pose(orientation)
+        self._apply_robot_root_pose()
         self._robot.set_default_state(
             position=self._robot_initial_position,
             orientation=orientation,
@@ -378,10 +370,8 @@ class HelloWorld(BaseSample):
             position=self._robot_initial_position,
             orientation=orientation,
         )
-        carb.log_warn(
-            f"[Placement] Applied robot initial pose {self._robot_initial_position.tolist()} with yaw {self._robot_initial_yaw:.3f}.")
 
-    def _apply_robot_root_pose(self, orientation):
+    def _apply_robot_root_pose(self):
         stage = omni.usd.get_context().get_stage()
         if stage is None:
             return
@@ -404,8 +394,6 @@ class HelloWorld(BaseSample):
     async def _wait_for_scene_assets_loaded(self):
         context = omni.usd.get_context()
         app = omni.kit.app.get_app()
-        carb.log_warn(
-            "[Assets] Waiting for scene assets to finish loading before NavMesh bake.")
 
         for frame in range(SCENE_ASSET_LOAD_MAX_FRAMES):
             await app.next_update_async()
@@ -426,8 +414,6 @@ class HelloWorld(BaseSample):
 
         for _ in range(SCENE_ASSET_LOAD_SETTLE_FRAMES):
             await app.next_update_async()
-        carb.log_warn(
-            f"[Assets] Scene asset wait complete; added {SCENE_ASSET_LOAD_SETTLE_FRAMES} settle frame(s).")
 
     def _setup_robot_follow_camera(self):
         stage = omni.usd.get_context().get_stage()
@@ -456,8 +442,6 @@ class HelloWorld(BaseSample):
                 "[Camera] Could not get active viewport; robot camera was created but not selected.")
             return
         viewport.camera_path = ROBOT_CAMERA_PRIM_PATH
-        carb.log_info(
-            f"[Camera] Active viewport attached to robot camera: {ROBOT_CAMERA_PRIM_PATH}")
 
     # ------------------------------------------------------------------
     # Random task placement
@@ -510,14 +494,6 @@ class HelloWorld(BaseSample):
         except Exception as exc:
             carb.log_warn(
                 f"[Placement] Could not move cube to randomized position {self._cube_position.tolist()}: {exc}")
-
-        carb.log_info(
-            f"[Placement] Cube randomized on {pick_candidate['prim_path']} at {self._cube_position.tolist()} "
-            f"(walkable distance {pick_candidate['walkable_distance']:.3f} m).")
-        carb.log_info(
-            f"[Placement] Target randomized on {place_candidate['prim_path']} at {self._place_cube_pos.tolist()} "
-            f"(walkable distance {place_candidate['walkable_distance']:.3f} m, "
-            f"path points {place_candidate['path_point_count']}).")
 
     def _find_keyword_placement_candidates(self, keywords):
         stage = omni.usd.get_context().get_stage()
@@ -582,10 +558,6 @@ class HelloWorld(BaseSample):
                     "prim_path": prim_path,
                 })
 
-        carb.log_warn(
-            f"[Placement] Found {len(candidates)} placement candidates from keywords {keywords} "
-            f"with cube center height in {CUBE_CENTER_HEIGHT_RANGE}, outward walkable offset >= "
-            f"{CUBE_PLACEMENT_MIN_OUTWARD_WALKABLE_OFFSET:.2f} m.")
         return candidates
 
     def _sample_surface_corner_positions(self, bbox_min, bbox_max):
@@ -698,14 +670,8 @@ class HelloWorld(BaseSample):
     def _resolve_robot_initial_pose_near_cube(self):
         best_position = None
         best_score = None
-        best_path_distance_to_cube = None
-        best_xy_distance_to_cube = None
-        best_projection_error = None
-        best_clearance_error = None
         best_uncleared = None
-        cube_xy = self._cube_position[:2]
         attempted_samples = 0
-        rejected_for_clearance = 0
         direct_fallback = self._direct_robot_start_near_cube()
         pick_goal = self._pick_goal_pos
         if pick_goal is None:
@@ -739,58 +705,34 @@ class HelloWorld(BaseSample):
                     path_distance_to_cube - ROBOT_START_TARGET_DISTANCE_FROM_CUBE)
                 projection_error = np.linalg.norm(walkable[:2] - sample[:2])
                 score = distance_error + 0.25 * projection_error
-                candidate = (
-                    score,
-                    walkable,
-                    path_distance_to_cube,
-                    np.linalg.norm(walkable[:2] - cube_xy),
-                    projection_error,
-                )
+                candidate = (score, walkable)
                 if best_uncleared is None or score < best_uncleared[0]:
                     best_uncleared = candidate
 
                 clearance_ok, clearance_error = self._robot_start_has_clearance(
                     walkable)
                 if not clearance_ok:
-                    rejected_for_clearance += 1
                     continue
 
                 score += 0.5 * clearance_error
                 if best_score is None or score < best_score:
                     best_score = score
                     best_position = walkable
-                    best_path_distance_to_cube = path_distance_to_cube
-                    best_xy_distance_to_cube = np.linalg.norm(
-                        walkable[:2] - cube_xy)
-                    best_projection_error = projection_error
-                    best_clearance_error = clearance_error
 
         if best_position is None:
             fallback_walkable = self._closest_walkable_point(direct_fallback)
             fallback_ok = False
-            fallback_clearance_error = None
             if fallback_walkable is not None:
-                fallback_path_distance = self._navmesh_path_distance(
-                    fallback_walkable, pick_goal)
-                fallback_ok, fallback_clearance_error = self._robot_start_has_clearance(
+                fallback_ok, _ = self._robot_start_has_clearance(
                     fallback_walkable)
-            else:
-                fallback_path_distance = None
 
             if fallback_ok:
                 carb.log_warn(
                     f"[Placement] No ring-sampled robot start passed clearance after {attempted_samples} walkable sample(s); "
                     f"using projected direct annulus start {fallback_walkable.tolist()}.")
                 best_position = fallback_walkable
-                best_path_distance_to_cube = fallback_path_distance
-                best_xy_distance_to_cube = np.linalg.norm(
-                    best_position[:2] - cube_xy)
-                best_projection_error = np.linalg.norm(
-                    best_position[:2] - direct_fallback[:2])
-                best_clearance_error = fallback_clearance_error
             elif best_uncleared is not None:
-                _, best_position, best_path_distance_to_cube, best_xy_distance_to_cube, best_projection_error = best_uncleared
-                best_clearance_error = None
+                _, best_position = best_uncleared
                 carb.log_warn(
                     f"[Placement] No robot start passed footprint clearance after {attempted_samples} walkable sample(s); "
                     "using best path-valid start anyway. It may be close to obstacles.")
@@ -800,12 +742,6 @@ class HelloWorld(BaseSample):
                     f"{ROBOT_START_MAX_DISTANCE_FROM_CUBE:.1f} m from cube after {attempted_samples} walkable sample(s); "
                     f"using direct annulus start {direct_fallback.tolist()}.")
                 best_position = direct_fallback
-                best_path_distance_to_cube = self._navmesh_path_distance(
-                    best_position, pick_goal)
-                best_xy_distance_to_cube = np.linalg.norm(
-                    best_position[:2] - cube_xy)
-                best_projection_error = 0.0
-                best_clearance_error = None
 
         self._robot_initial_position = best_position
         target_yaw = np.arctan2(
@@ -814,14 +750,6 @@ class HelloWorld(BaseSample):
         )
         self._robot_initial_yaw = self._wrap_angle(
             target_yaw - ROBOT_SIDE_YAW_OFFSETS["+Y"])
-        carb.log_warn(
-            f"[Placement] Robot start set to {self._robot_initial_position.tolist()} "
-            f"(nav path distance {self._format_distance(best_path_distance_to_cube)}, "
-            f"XY distance {best_xy_distance_to_cube:.2f} m, "
-            f"projection error {best_projection_error:.2f} m, {attempted_samples} walkable sample(s)), "
-            f"clearance error {self._format_distance(best_clearance_error)}, "
-            f"clearance rejects {rejected_for_clearance}, "
-            f"yaw {self._robot_initial_yaw:.3f}.")
 
     def _robot_start_has_clearance(self, position):
         center = np.asarray(position, dtype=float)
@@ -891,7 +819,7 @@ class HelloWorld(BaseSample):
                     self._state = PickPlaceState.SETTLE
 
         elif self._state == PickPlaceState.FACE_CUBE:
-            if self._face_target_step(self._get_current_cube_position(), "pick"):
+            if self._face_target_step(self._get_current_cube_position()):
                 self._stop_wheels()
                 self._settle_count = 0
                 self._state = PickPlaceState.SETTLE
@@ -930,7 +858,7 @@ class HelloWorld(BaseSample):
 
         elif self._state == PickPlaceState.FACE_PLACE:
             self._close_gripper()
-            if self._face_target_step(self._place_cube_pos, "place"):
+            if self._face_target_step(self._place_cube_pos):
                 self._stop_wheels()
                 self._prepare_place_sequence()
                 self._state = PickPlaceState.PLACE_RELEASE
@@ -941,7 +869,6 @@ class HelloWorld(BaseSample):
                 self._open_gripper()
                 self._stop_wheels()
                 self._state = PickPlaceState.DONE
-                carb.log_info("Pick and place task complete.")
 
     # ------------------------------------------------------------------
     # Navigation
@@ -977,7 +904,7 @@ class HelloWorld(BaseSample):
         self._apply_wheel_velocity_action(wheel_action)
         return False
 
-    def _face_target_step(self, target_pos, label):
+    def _face_target_step(self, target_pos):
         if self._wheel_subset is None:
             return True
 
@@ -987,7 +914,7 @@ class HelloWorld(BaseSample):
             target_pos[0] - robot_pos[0],
         )
         robot_yaw = quat_to_euler_angles(robot_quat)[-1]
-        side_name, signed_error, side_yaw = self._choose_nearest_robot_side_error(
+        signed_error = self._choose_nearest_robot_side_error(
             robot_yaw, target_yaw)
         rotate_angle = abs(signed_error)
 
@@ -1017,12 +944,12 @@ class HelloWorld(BaseSample):
         return self._robot.get_world_pose()
 
     def _choose_nearest_robot_side_error(self, robot_yaw, target_yaw):
-        candidates = []
-        for side_name, side_offset in ROBOT_SIDE_YAW_OFFSETS.items():
+        errors = []
+        for side_offset in ROBOT_SIDE_YAW_OFFSETS.values():
             side_yaw = self._wrap_angle(robot_yaw + side_offset)
             signed_error = self._wrap_angle(target_yaw - side_yaw)
-            candidates.append((side_name, signed_error, side_yaw))
-        return min(candidates, key=lambda item: abs(item[1]))
+            errors.append(signed_error)
+        return min(errors, key=abs)
 
     def _wrap_angle(self, angle):
         return (angle + np.pi) % (2.0 * np.pi) - np.pi
@@ -1032,10 +959,6 @@ class HelloWorld(BaseSample):
         velocities = np.asarray(velocities, dtype=float)
         if velocities.size != len(self._wheel_joint_names):
             velocities = velocities[: len(self._wheel_joint_names)]
-        self._nav_log_counter += 1
-        if self._nav_log_counter % 60 == 0:
-            carb.log_info(
-                f"[Nav] wheel velocity command {velocities.tolist()} on {self._wheel_joint_names}")
         self._wheel_subset.apply_action(joint_velocities=velocities)
 
     def _stop_wheels(self):
@@ -1110,15 +1033,13 @@ class HelloWorld(BaseSample):
 
             target_ground = carb.Float3(
                 float(target_pos[0]), float(target_pos[1]), 0.0)
-            closest, island_id = navmesh.query_closest_point(target_ground)
+            closest, _ = navmesh.query_closest_point(target_ground)
             if closest is None:
                 carb.log_warn(
                     f"[NavMesh] No closest walkable point found for {label}; using fallback {fallback.tolist()}.")
                 return fallback
 
             walkable_goal = np.array([closest.x, closest.y, 0.0], dtype=float)
-            carb.log_info(
-                f"[NavMesh] {label.capitalize()} goal resolved from XY {fallback.tolist()} to walkable {walkable_goal.tolist()} on island {island_id}.")
             return walkable_goal
         except Exception as exc:
             carb.log_warn(
@@ -1148,7 +1069,6 @@ class HelloWorld(BaseSample):
                 NAVMESH_MIN_RADIUS,
             )
             await omni.kit.app.get_app().next_update_async()
-            carb.log_info("[NavMesh] Baking...")
             started = nav.start_navmesh_baking()
             if not started:
                 carb.log_warn("[NavMesh] Baking did not start.")
@@ -1160,9 +1080,6 @@ class HelloWorld(BaseSample):
                 carb.log_warn(
                     "[NavMesh] Bake finished but no navmesh was produced.")
                 return
-            draw_vertices = navmesh.get_draw_triangles(0)
-            carb.log_info(
-                f"[NavMesh] Bake complete. Draw triangle vertices: {len(draw_vertices)}")
         except Exception as exc:
             carb.log_warn(
                 f"Runtime NavMesh baking failed; using direct fallback paths. Details: {exc}")
@@ -1207,8 +1124,6 @@ class HelloWorld(BaseSample):
         colors = [PATH_LINE_COLOR] * len(starts)
         widths = [PATH_LINE_WIDTH] * len(starts)
         draw.draw_lines(starts, ends, colors, widths)
-        carb.log_info(
-            f"[NavMesh] Drew path with {len(starts)} red line segments.")
 
     def _clear_debug_path(self):
         if self._debug_draw is None:
@@ -1300,8 +1215,6 @@ class HelloWorld(BaseSample):
 
     def _prepare_grasp_sequence(self):
         cube_pos = self._get_current_cube_position(log_fail=True)
-        carb.log_info(
-            f"[Cube] Preparing grasp using current cube position {cube_pos.tolist()}.")
 
         pre_grasp = cube_pos + np.array([0.0, 0.0, self.pre_grasp_height])
         grasp = cube_pos + np.array([0.0, 0.0, self.grasp_height_offset])
@@ -1322,7 +1235,6 @@ class HelloWorld(BaseSample):
                     self.gripper_open,
                     settle_steps=self.fetch_open_settle_steps,
                     target_joints=current_joints,
-                    label="open_gripper_before_fetch",
                     trajectory_steps=1,
                 )
             )
@@ -1333,7 +1245,6 @@ class HelloWorld(BaseSample):
                 self.gripper_open,
                 settle_steps=self.fetch_pre_grasp_settle_steps,
                 ee_tolerance=0.04,
-                label="move_to_pre_grasp_above_cube",
                 trajectory_steps=self.fetch_pre_grasp_move_steps,
             ),
             ArmSegment(
@@ -1341,7 +1252,6 @@ class HelloWorld(BaseSample):
                 self.gripper_open,
                 settle_steps=self.fetch_descent_settle_steps,
                 ee_tolerance=0.035,
-                label="descend_to_grasp_cube",
                 trajectory_steps=self.fetch_descent_move_steps,
             ),
             ArmSegment(
@@ -1349,7 +1259,6 @@ class HelloWorld(BaseSample):
                 self.gripper_closed,
                 settle_steps=self.fetch_close_settle_steps,
                 ee_tolerance=0.035,
-                label="close_gripper_on_cube",
                 trajectory_steps=1,
             ),
             ArmSegment(
@@ -1357,7 +1266,6 @@ class HelloWorld(BaseSample):
                 self.gripper_closed,
                 settle_steps=self.fetch_lift_settle_steps,
                 ee_tolerance=0.04,
-                label="lift_object_to_pre_grasp",
                 trajectory_steps=self.fetch_lift_move_steps,
             ),
         ])
@@ -1410,16 +1318,8 @@ class HelloWorld(BaseSample):
                 self._arm_subset.apply_action(
                     joint_positions=segment.trajectory[-1])
             segment.reach_waited += 1
-            if segment.reach_waited == 1 or segment.reach_waited % 60 == 0:
-                ee_pos, _ = self._ee_prim.get_world_pose()
-                error = np.linalg.norm(
-                    np.asarray(ee_pos, dtype=float) - segment.target_pos)
-                # carb.log_warn(
-                #     f"[Arm] Waiting for {segment.label} to reach target; error {error:.3f} m.")
             if segment.reach_waited < segment.reach_timeout_steps:
                 return False
-            # carb.log_warn(
-            #     f"[Arm] Continuing after timeout waiting for {segment.label}; target may not be reached.")
 
         segment.waited += 1
         if segment.waited >= segment.settle_steps:
