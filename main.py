@@ -3,6 +3,7 @@
 
 import asyncio
 import importlib
+import random
 from enum import Enum, auto
 
 import carb
@@ -11,7 +12,7 @@ import numpy as np
 import omni.kit.app
 import omni.usd
 from omni.kit.viewport.utility import get_active_viewport
-from pxr import Gf, UsdGeom
+from pxr import Gf, Usd, UsdGeom
 from isaacsim.core.api.articulations import ArticulationSubset
 from isaacsim.core.api.objects import DynamicCuboid
 from isaacsim.core.prims import SingleArticulation, SingleXFormPrim
@@ -35,38 +36,90 @@ except Exception:
 
 
 # -----------------------------------------------------------------------------
-# Fill these values in for your scene.
+# Scene asset paths
 # -----------------------------------------------------------------------------
 SCENE_USD_PATH = r"C:\Users\user\NTHU\digital_twin\dataset\midterm\asset\hospital.usd"
 ROBOT_USD_PATH = r"C:\Users\user\NTHU\digital_twin\dataset\midterm\asset\custom_robot.usd"
+
+# -----------------------------------------------------------------------------
+# Robot prim paths
+# -----------------------------------------------------------------------------
 ROBOT_PRIM_PATH = "/World/nova_carter"
 ROBOT_ARTICULATION_PRIM_PATH = ROBOT_PRIM_PATH + "/nova_carter"
 CHASSIS_PRIM_PATH = ROBOT_ARTICULATION_PRIM_PATH + "/chassis_link"
 FRANKA_BASE_PRIM_PATH = ROBOT_ARTICULATION_PRIM_PATH + "/franka/panda_link0"
 END_EFFECTOR_PRIM_PATH = ROBOT_ARTICULATION_PRIM_PATH + "/franka/panda_hand"
 ROBOT_CAMERA_PRIM_PATH = CHASSIS_PRIM_PATH + "/rear_follow_camera"
+
+# -----------------------------------------------------------------------------
+# Robot camera pose
+# -----------------------------------------------------------------------------
 ROBOT_CAMERA_LOCAL_EYE = np.array([-2, 0.0, 4])
 ROBOT_CAMERA_LOCAL_TARGET = np.array([0.65, 0.0, 0.45])
+
+# -----------------------------------------------------------------------------
+# Robot start placement
+# -----------------------------------------------------------------------------
 ROBOT_INITIAL_POSITION = np.array([6.0, -1.0, 0.0])
 ROBOT_INITIAL_YAW = 0.0
-NAVMESH_MIN_RADIUS = 30
-CUBE_PRIM_PATH = "/World/TaskCube"
+ROBOT_START_MIN_DISTANCE_FROM_CUBE = 5.0
+ROBOT_START_MAX_DISTANCE_FROM_CUBE = 8.0
+ROBOT_START_TARGET_DISTANCE_FROM_CUBE = 6.5
+ROBOT_START_RING_SAMPLES = 72
+ROBOT_START_CLEARANCE_RADIUS = 0.65
+ROBOT_START_CLEARANCE_MAX_PROJECTION = 0.10
+ROBOT_START_CLEARANCE_SAMPLES = 16
+
+# -----------------------------------------------------------------------------
+# Navigation and path drawing
+# -----------------------------------------------------------------------------
+NAVMESH_MIN_RADIUS = 40
 PATH_LINE_COLOR = (1.0, 0.0, 0.0, 1.0)
 PATH_LINE_WIDTH = 8
 PATH_LINE_Z_OFFSET = 0.05
 NAV_LINEAR_VELOCITY = 0.35
 NAV_YAW_VELOCITY = 0.8
-FACE_CUBE_YAW_TOLERANCE = 0.08
+ENABLE_FACE_TARGET_STATES = True
+FACE_CUBE_YAW_TOLERANCE = 0.02
 FACE_CUBE_YAW_VELOCITY = 0.5
+
+# -----------------------------------------------------------------------------
+# Cube placement and task selection
+# -----------------------------------------------------------------------------
+CUBE_PRIM_PATH = "/World/TaskCube"
+CUBE_SIZE = 0.05
+RANDOMIZE_CUBE_POSITIONS = True
+CUBE_POSITION_NAME_KEYWORDS = ["SideTable", "Desk"]
+CUBE_PLACEMENT_SURFACE_MARGIN = 0.03
+CUBE_PLACEMENT_MAX_WALKABLE_DISTANCE = 0.6
+CUBE_PLACEMENT_MIN_OUTWARD_WALKABLE_OFFSET = 0.02
+CUBE_MIN_PICK_PLACE_DISTANCE = 5.0
+CUBE_MAX_PICK_PLACE_PATH_POINTS = 500
+CUBE_CENTER_HEIGHT_RANGE = (0.8, 0.90)
+
+# -----------------------------------------------------------------------------
+# Scene loading timing
+# -----------------------------------------------------------------------------
+SCENE_ASSET_LOAD_MAX_FRAMES = 300
+SCENE_ASSET_LOAD_SETTLE_FRAMES = 5
+
+# -----------------------------------------------------------------------------
+# Robot orientation helpers
+# -----------------------------------------------------------------------------
 ROBOT_SIDE_YAW_OFFSETS = {
     "+Y": np.pi / 2.0,
     "-Y": -np.pi / 2.0,
 }
 
-# Manual task variables requested in the homework.
+# -----------------------------------------------------------------------------
+# Manual homework task positions
+# -----------------------------------------------------------------------------
 cube_position = np.array([9.98115, -1.39854, 0.83727])
 place_cube_pos = np.array([22.93955, -3.11071, 0.85179])
 
+# -----------------------------------------------------------------------------
+# Robot joint names
+# -----------------------------------------------------------------------------
 WHEEL_JOINT_NAMES = ["joint_wheel_left", "joint_wheel_right"]
 ARM_JOINT_NAMES = [
     "panda_joint1",
@@ -85,7 +138,6 @@ class PickPlaceState(Enum):
     FACE_CUBE = auto()
     SETTLE = auto()
     GRASP_SEQUENCE = auto()
-    LIFT = auto()
     ADJUST_ARM_X = auto()
     NAVIGATE_TO_PLACE = auto()
     FACE_PLACE = auto()
@@ -94,7 +146,17 @@ class PickPlaceState(Enum):
 
 
 class ArmSegment:
-    def __init__(self, target_pos, gripper_width, settle_steps=0, ee_tolerance=0.025, target_joints=None):
+    def __init__(
+        self,
+        target_pos,
+        gripper_width,
+        settle_steps=0,
+        ee_tolerance=0.025,
+        target_joints=None,
+        label="arm_segment",
+        reach_timeout_steps=240,
+        trajectory_steps=None,
+    ):
         self.target_pos = None if target_pos is None else np.asarray(
             target_pos, dtype=float)
         self.gripper_width = gripper_width
@@ -105,15 +167,23 @@ class ArmSegment:
         self.trajectory = []
         self.index = 0
         self.waited = 0
+        self.reach_waited = 0
         self.ik_solved = False
+        self.label = label
+        self.reach_timeout_steps = reach_timeout_steps
+        self.trajectory_steps = trajectory_steps
 
 
 class HelloWorld(BaseSample):
     def __init__(self) -> None:
         super().__init__()
+
+        # World simulation timing
         self._world_settings["stage_units_in_meters"] = 1.0
         self._world_settings["physics_dt"] = 1.0 / 120.0
         self._world_settings["rendering_dt"] = 1.0 / 60.0
+
+        # Runtime scene and robot handles
         self._robot = None
         self._cube = None
         self._robot_controller = None
@@ -129,7 +199,14 @@ class HelloWorld(BaseSample):
         self._franka_base_prim = None
         self._ee_prim = None
         self._debug_draw = None
+
+        # Pick/place task state
         self._state = PickPlaceState.NAVIGATE_TO_PICK
+        self._cube_position = np.array(cube_position, dtype=float)
+        self._place_cube_pos = np.array(place_cube_pos, dtype=float)
+        self._robot_initial_position = np.array(
+            ROBOT_INITIAL_POSITION, dtype=float)
+        self._robot_initial_yaw = ROBOT_INITIAL_YAW
         self._pick_goal_pos = None
         self._place_goal_pos = None
         self._path = []
@@ -140,14 +217,30 @@ class HelloWorld(BaseSample):
         self._active_segment = None
         self._holding_object = False
         self._task_started = False
+
+        # Navigation thresholds
         self.waypoint_threshold = 0.18
-        self.goal_threshold = 0.12
+        self.goal_threshold = 0.02
         self.settle_steps_after_stop = 55
+
+        # Gripper widths and end-effector heights
         self.gripper_open = 0.05
         self.gripper_closed = 0.005
-        self.pre_grasp_height = 0.1
+        self.pre_grasp_height = 0.25
         self.grasp_height_offset = 0.02
-        self.lift_height = 0.1
+        self.lift_height = 0.25
+
+        # Fetch sequence timing
+        self.fetch_open_settle_steps = 20
+        self.fetch_pre_grasp_move_steps = 140
+        self.fetch_pre_grasp_settle_steps = 20
+        self.fetch_descent_move_steps = 140
+        self.fetch_descent_settle_steps = 20
+        self.fetch_close_settle_steps = 20
+        self.fetch_lift_move_steps = 140
+        self.fetch_lift_settle_steps = 20
+
+        # Post-grasp arm adjustment
         self.post_lift_straight_arm_joints = np.array(
             [0.0, -0.35, 0.0, -1.80, 0.0, 1.45, 0.75],
             dtype=float,
@@ -161,15 +254,20 @@ class HelloWorld(BaseSample):
         self._cube = world.scene.add(DynamicCuboid(
             prim_path=CUBE_PRIM_PATH,
             name="task_cube",
-            position=cube_position,
-            size=0.05,
+            position=self._cube_position,
+            size=CUBE_SIZE,
             color=np.array([0.1, 0.55, 1.0]),
             mass=0.05,
         ))
 
     async def setup_post_load(self):
         world = self.get_world()
+        carb.log_warn(
+            "[Placement] setup_post_load reached; resolving randomized task and robot start.")
+        await self._wait_for_scene_assets_loaded()
         await self._bake_navmesh()
+        self._randomize_task_positions_from_keywords()
+        self._resolve_robot_initial_pose_near_cube()
         self._pick_goal_pos = self._resolve_pick_goal_pos()
         self._place_goal_pos = self._resolve_place_goal_pos()
         await self._load_robot_after_navmesh_bake()
@@ -269,16 +367,67 @@ class HelloWorld(BaseSample):
     def _set_robot_initial_pose(self):
         if self._robot is None:
             return
+        orientation = euler_angles_to_quat(
+            np.array([0.0, 0.0, self._robot_initial_yaw]))
+        self._apply_robot_root_pose(orientation)
         self._robot.set_default_state(
-            position=ROBOT_INITIAL_POSITION,
-            orientation=euler_angles_to_quat(
-                np.array([0.0, 0.0, ROBOT_INITIAL_YAW])),
+            position=self._robot_initial_position,
+            orientation=orientation,
         )
         self._robot.set_world_pose(
-            position=ROBOT_INITIAL_POSITION,
-            orientation=euler_angles_to_quat(
-                np.array([0.0, 0.0, ROBOT_INITIAL_YAW])),
+            position=self._robot_initial_position,
+            orientation=orientation,
         )
+        carb.log_warn(
+            f"[Placement] Applied robot initial pose {self._robot_initial_position.tolist()} with yaw {self._robot_initial_yaw:.3f}.")
+
+    def _apply_robot_root_pose(self, orientation):
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return
+
+        prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
+        if not prim.IsValid():
+            return
+
+        xform_api = UsdGeom.XformCommonAPI(prim)
+        xform_api.SetTranslate(Gf.Vec3d(
+            float(self._robot_initial_position[0]),
+            float(self._robot_initial_position[1]),
+            float(self._robot_initial_position[2]),
+        ))
+        xform_api.SetRotate(
+            Gf.Vec3f(0.0, 0.0, float(np.degrees(self._robot_initial_yaw))),
+            UsdGeom.XformCommonAPI.RotationOrderXYZ,
+        )
+
+    async def _wait_for_scene_assets_loaded(self):
+        context = omni.usd.get_context()
+        app = omni.kit.app.get_app()
+        carb.log_warn(
+            "[Assets] Waiting for scene assets to finish loading before NavMesh bake.")
+
+        for frame in range(SCENE_ASSET_LOAD_MAX_FRAMES):
+            await app.next_update_async()
+            try:
+                loading = context.get_stage_loading_status()
+                if isinstance(loading, (tuple, list)):
+                    pending = sum(int(value) for value in loading)
+                    if pending == 0:
+                        break
+                elif not loading:
+                    break
+            except Exception:
+                # Some Isaac/Kit versions do not expose stage loading status.
+                break
+        else:
+            carb.log_warn(
+                f"[Assets] Scene asset loading did not report idle after {SCENE_ASSET_LOAD_MAX_FRAMES} frame(s); baking anyway.")
+
+        for _ in range(SCENE_ASSET_LOAD_SETTLE_FRAMES):
+            await app.next_update_async()
+        carb.log_warn(
+            f"[Assets] Scene asset wait complete; added {SCENE_ASSET_LOAD_SETTLE_FRAMES} settle frame(s).")
 
     def _setup_robot_follow_camera(self):
         stage = omni.usd.get_context().get_stage()
@@ -310,6 +459,406 @@ class HelloWorld(BaseSample):
         carb.log_info(
             f"[Camera] Active viewport attached to robot camera: {ROBOT_CAMERA_PRIM_PATH}")
 
+    # ------------------------------------------------------------------
+    # Random task placement
+    # ------------------------------------------------------------------
+    def _randomize_task_positions_from_keywords(self):
+        if not RANDOMIZE_CUBE_POSITIONS:
+            return
+
+        candidates = self._find_keyword_placement_candidates(
+            CUBE_POSITION_NAME_KEYWORDS)
+        if len(candidates) < 2:
+            carb.log_warn(
+                f"[Placement] Need at least 2 valid keyword placement candidates; found {len(candidates)}. "
+                "Using fixed cube/task positions.")
+            return
+
+        random.shuffle(candidates)
+        pick_candidate = random.choice(candidates)
+        place_candidates = []
+        for candidate in candidates:
+            if np.linalg.norm(candidate["position"][:2] - pick_candidate["position"][:2]) < CUBE_MIN_PICK_PLACE_DISTANCE:
+                continue
+
+            path_point_count = self._placement_path_point_count(
+                pick_candidate["walkable_goal"], candidate["walkable_goal"])
+            if path_point_count is None or path_point_count > CUBE_MAX_PICK_PLACE_PATH_POINTS:
+                continue
+
+            candidate = dict(candidate)
+            candidate["path_point_count"] = path_point_count
+            place_candidates.append(candidate)
+
+        if not place_candidates:
+            carb.log_warn(
+                f"[Placement] No target candidate at least {CUBE_MIN_PICK_PLACE_DISTANCE:.1f} m away "
+                f"and within {CUBE_MAX_PICK_PLACE_PATH_POINTS} nav path point(s) from the picked cube position. "
+                "Using fixed target position.")
+            return
+
+        place_candidate = random.choice(place_candidates)
+        self._cube_position = pick_candidate["position"].copy()
+        self._place_cube_pos = place_candidate["position"].copy()
+        self._pick_goal_pos = pick_candidate["walkable_goal"].copy()
+        self._place_goal_pos = place_candidate["walkable_goal"].copy()
+
+        try:
+            self._cube.set_world_pose(position=self._cube_position)
+            if hasattr(self._cube, "set_default_state"):
+                self._cube.set_default_state(position=self._cube_position)
+        except Exception as exc:
+            carb.log_warn(
+                f"[Placement] Could not move cube to randomized position {self._cube_position.tolist()}: {exc}")
+
+        carb.log_info(
+            f"[Placement] Cube randomized on {pick_candidate['prim_path']} at {self._cube_position.tolist()} "
+            f"(walkable distance {pick_candidate['walkable_distance']:.3f} m).")
+        carb.log_info(
+            f"[Placement] Target randomized on {place_candidate['prim_path']} at {self._place_cube_pos.tolist()} "
+            f"(walkable distance {place_candidate['walkable_distance']:.3f} m, "
+            f"path points {place_candidate['path_point_count']}).")
+
+    def _find_keyword_placement_candidates(self, keywords):
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            carb.log_warn("[Placement] Could not get USD stage.")
+            return []
+
+        lowered_keywords = [keyword.lower() for keyword in keywords]
+        bbox_cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+            useExtentsHint=True,
+        )
+        candidates = []
+
+        for prim in stage.Traverse():
+            if not prim.IsActive():
+                continue
+            prim_path = str(prim.GetPath())
+            if prim_path == CUBE_PRIM_PATH:
+                continue
+            searchable_name = f"{prim.GetName()} {prim_path}".lower()
+            if not any(keyword in searchable_name for keyword in lowered_keywords):
+                continue
+
+            try:
+                aligned_box = bbox_cache.ComputeWorldBound(
+                    prim).ComputeAlignedBox()
+                bbox_min = np.array(aligned_box.GetMin(), dtype=float)
+                bbox_max = np.array(aligned_box.GetMax(), dtype=float)
+            except Exception as exc:
+                carb.log_warn(
+                    f"[Placement] Could not compute bounds for {prim_path}: {exc}")
+                continue
+
+            extents = bbox_max - bbox_min
+            top_center_z = bbox_max[2] + CUBE_SIZE * 0.5
+            if extents[0] <= CUBE_SIZE or extents[1] <= CUBE_SIZE:
+                continue
+            if not (CUBE_CENTER_HEIGHT_RANGE[0] <= top_center_z <= CUBE_CENTER_HEIGHT_RANGE[1]):
+                continue
+
+            for position, outward_normals in self._sample_surface_corner_positions(bbox_min, bbox_max):
+                walkable_goal = self._closest_walkable_point(position)
+                if walkable_goal is None:
+                    continue
+                walkable_distance = np.linalg.norm(
+                    position[:2] - walkable_goal[:2])
+                if walkable_distance > CUBE_PLACEMENT_MAX_WALKABLE_DISTANCE:
+                    continue
+                walkable_offset = walkable_goal[:2] - position[:2]
+                outward_offset = min(
+                    np.dot(walkable_offset, outward_normal)
+                    for outward_normal in outward_normals
+                )
+                if outward_offset < CUBE_PLACEMENT_MIN_OUTWARD_WALKABLE_OFFSET:
+                    continue
+                candidates.append({
+                    "position": position,
+                    "walkable_goal": walkable_goal,
+                    "walkable_distance": walkable_distance,
+                    "prim_path": prim_path,
+                })
+
+        carb.log_warn(
+            f"[Placement] Found {len(candidates)} placement candidates from keywords {keywords} "
+            f"with cube center height in {CUBE_CENTER_HEIGHT_RANGE}, outward walkable offset >= "
+            f"{CUBE_PLACEMENT_MIN_OUTWARD_WALKABLE_OFFSET:.2f} m.")
+        return candidates
+
+    def _sample_surface_corner_positions(self, bbox_min, bbox_max):
+        x_min, y_min, _ = bbox_min
+        x_max, y_max, z_max = bbox_max
+        edge_inset = CUBE_SIZE * 0.5 + CUBE_PLACEMENT_SURFACE_MARGIN
+        x_low = min(x_max, x_min + edge_inset)
+        x_high = max(x_min, x_max - edge_inset)
+        y_low = min(y_max, y_min + edge_inset)
+        y_high = max(y_min, y_max - edge_inset)
+        top_center_z = z_max + CUBE_SIZE * 0.5
+        positions = [
+            (
+                np.array([x_low, y_low, top_center_z], dtype=float),
+                (np.array([-1.0, 0.0], dtype=float),
+                 np.array([0.0, -1.0], dtype=float)),
+            ),
+            (
+                np.array([x_low, y_high, top_center_z], dtype=float),
+                (np.array([-1.0, 0.0], dtype=float),
+                 np.array([0.0, 1.0], dtype=float)),
+            ),
+            (
+                np.array([x_high, y_low, top_center_z], dtype=float),
+                (np.array([1.0, 0.0], dtype=float),
+                 np.array([0.0, -1.0], dtype=float)),
+            ),
+            (
+                np.array([x_high, y_high, top_center_z], dtype=float),
+                (np.array([1.0, 0.0], dtype=float),
+                 np.array([0.0, 1.0], dtype=float)),
+            ),
+        ]
+        random.shuffle(positions)
+        return positions
+
+    def _closest_walkable_point(self, target_pos):
+        nav = self._get_navigation_interface()
+        if nav is None:
+            return None
+
+        try:
+            navmesh = nav.get_navmesh()
+            if navmesh is None:
+                return None
+            target_ground = carb.Float3(
+                float(target_pos[0]), float(target_pos[1]), 0.0)
+            closest, _ = navmesh.query_closest_point(target_ground)
+            if closest is None:
+                return None
+            return np.array([closest.x, closest.y, 0.0], dtype=float)
+        except Exception as exc:
+            carb.log_warn(
+                f"[Placement] Could not query closest walkable point for {target_pos.tolist()}: {exc}")
+            return None
+
+    def _placement_path_point_count(self, start_pos, goal_pos):
+        nav = self._get_navigation_interface()
+        if nav is None:
+            return 2
+
+        try:
+            navmesh = nav.get_navmesh()
+            if navmesh is None:
+                return 2
+            path = navmesh.query_shortest_path(
+                start_pos=carb.Float3(
+                    float(start_pos[0]), float(start_pos[1]), float(start_pos[2])),
+                end_pos=carb.Float3(
+                    float(goal_pos[0]), float(goal_pos[1]), float(goal_pos[2])),
+            )
+            if path is None or path.get_point_count() <= 0:
+                return None
+            return path.get_point_count()
+        except Exception as exc:
+            carb.log_warn(
+                f"[Placement] Could not query pick-to-place path point count: {exc}")
+            return None
+
+    def _navmesh_path_distance(self, start_pos, goal_pos):
+        nav = self._get_navigation_interface()
+        if nav is None:
+            return None
+
+        try:
+            navmesh = nav.get_navmesh()
+            if navmesh is None:
+                return None
+            start = np.asarray(start_pos, dtype=float)
+            goal = np.asarray(goal_pos, dtype=float)
+            path = navmesh.query_shortest_path(
+                start_pos=carb.Float3(
+                    float(start[0]), float(start[1]), float(start[2])),
+                end_pos=carb.Float3(
+                    float(goal[0]), float(goal[1]), float(goal[2])),
+            )
+            if path is None or path.get_point_count() < 2:
+                return None
+            points = [np.array([p.x, p.y, p.z], dtype=float)
+                      for p in path.get_points()]
+            return sum(
+                np.linalg.norm(points[index] - points[index - 1])
+                for index in range(1, len(points))
+            )
+        except Exception as exc:
+            carb.log_warn(
+                f"[Placement] Could not query robot-start navmesh path distance: {exc}")
+            return None
+
+    def _resolve_robot_initial_pose_near_cube(self):
+        best_position = None
+        best_score = None
+        best_path_distance_to_cube = None
+        best_xy_distance_to_cube = None
+        best_projection_error = None
+        best_clearance_error = None
+        best_uncleared = None
+        cube_xy = self._cube_position[:2]
+        attempted_samples = 0
+        rejected_for_clearance = 0
+        direct_fallback = self._direct_robot_start_near_cube()
+        pick_goal = self._pick_goal_pos
+        if pick_goal is None:
+            pick_goal = self._resolve_pick_goal_pos()
+
+        for index in range(ROBOT_START_RING_SAMPLES):
+            angle = 2.0 * np.pi * index / ROBOT_START_RING_SAMPLES
+            for distance in (
+                ROBOT_START_MIN_DISTANCE_FROM_CUBE,
+                ROBOT_START_TARGET_DISTANCE_FROM_CUBE,
+                ROBOT_START_MAX_DISTANCE_FROM_CUBE,
+            ):
+                sample = np.array([
+                    self._cube_position[0] + distance * np.cos(angle),
+                    self._cube_position[1] + distance * np.sin(angle),
+                    0.0,
+                ], dtype=float)
+                walkable = self._closest_walkable_point(sample)
+                if walkable is None:
+                    continue
+
+                attempted_samples += 1
+                path_distance_to_cube = self._navmesh_path_distance(
+                    walkable, pick_goal)
+                if path_distance_to_cube is None:
+                    continue
+                if not (ROBOT_START_MIN_DISTANCE_FROM_CUBE <= path_distance_to_cube <= ROBOT_START_MAX_DISTANCE_FROM_CUBE):
+                    continue
+
+                distance_error = abs(
+                    path_distance_to_cube - ROBOT_START_TARGET_DISTANCE_FROM_CUBE)
+                projection_error = np.linalg.norm(walkable[:2] - sample[:2])
+                score = distance_error + 0.25 * projection_error
+                candidate = (
+                    score,
+                    walkable,
+                    path_distance_to_cube,
+                    np.linalg.norm(walkable[:2] - cube_xy),
+                    projection_error,
+                )
+                if best_uncleared is None or score < best_uncleared[0]:
+                    best_uncleared = candidate
+
+                clearance_ok, clearance_error = self._robot_start_has_clearance(
+                    walkable)
+                if not clearance_ok:
+                    rejected_for_clearance += 1
+                    continue
+
+                score += 0.5 * clearance_error
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_position = walkable
+                    best_path_distance_to_cube = path_distance_to_cube
+                    best_xy_distance_to_cube = np.linalg.norm(
+                        walkable[:2] - cube_xy)
+                    best_projection_error = projection_error
+                    best_clearance_error = clearance_error
+
+        if best_position is None:
+            fallback_walkable = self._closest_walkable_point(direct_fallback)
+            fallback_ok = False
+            fallback_clearance_error = None
+            if fallback_walkable is not None:
+                fallback_path_distance = self._navmesh_path_distance(
+                    fallback_walkable, pick_goal)
+                fallback_ok, fallback_clearance_error = self._robot_start_has_clearance(
+                    fallback_walkable)
+            else:
+                fallback_path_distance = None
+
+            if fallback_ok:
+                carb.log_warn(
+                    f"[Placement] No ring-sampled robot start passed clearance after {attempted_samples} walkable sample(s); "
+                    f"using projected direct annulus start {fallback_walkable.tolist()}.")
+                best_position = fallback_walkable
+                best_path_distance_to_cube = fallback_path_distance
+                best_xy_distance_to_cube = np.linalg.norm(
+                    best_position[:2] - cube_xy)
+                best_projection_error = np.linalg.norm(
+                    best_position[:2] - direct_fallback[:2])
+                best_clearance_error = fallback_clearance_error
+            elif best_uncleared is not None:
+                _, best_position, best_path_distance_to_cube, best_xy_distance_to_cube, best_projection_error = best_uncleared
+                best_clearance_error = None
+                carb.log_warn(
+                    f"[Placement] No robot start passed footprint clearance after {attempted_samples} walkable sample(s); "
+                    "using best path-valid start anyway. It may be close to obstacles.")
+            else:
+                carb.log_warn(
+                    f"[Placement] No robot start with navmesh path distance {ROBOT_START_MIN_DISTANCE_FROM_CUBE:.1f}-"
+                    f"{ROBOT_START_MAX_DISTANCE_FROM_CUBE:.1f} m from cube after {attempted_samples} walkable sample(s); "
+                    f"using direct annulus start {direct_fallback.tolist()}.")
+                best_position = direct_fallback
+                best_path_distance_to_cube = self._navmesh_path_distance(
+                    best_position, pick_goal)
+                best_xy_distance_to_cube = np.linalg.norm(
+                    best_position[:2] - cube_xy)
+                best_projection_error = 0.0
+                best_clearance_error = None
+
+        self._robot_initial_position = best_position
+        target_yaw = np.arctan2(
+            self._cube_position[1] - best_position[1],
+            self._cube_position[0] - best_position[0],
+        )
+        self._robot_initial_yaw = self._wrap_angle(
+            target_yaw - ROBOT_SIDE_YAW_OFFSETS["+Y"])
+        carb.log_warn(
+            f"[Placement] Robot start set to {self._robot_initial_position.tolist()} "
+            f"(nav path distance {self._format_distance(best_path_distance_to_cube)}, "
+            f"XY distance {best_xy_distance_to_cube:.2f} m, "
+            f"projection error {best_projection_error:.2f} m, {attempted_samples} walkable sample(s)), "
+            f"clearance error {self._format_distance(best_clearance_error)}, "
+            f"clearance rejects {rejected_for_clearance}, "
+            f"yaw {self._robot_initial_yaw:.3f}.")
+
+    def _robot_start_has_clearance(self, position):
+        center = np.asarray(position, dtype=float)
+        max_projection_error = 0.0
+        for index in range(ROBOT_START_CLEARANCE_SAMPLES):
+            angle = 2.0 * np.pi * index / ROBOT_START_CLEARANCE_SAMPLES
+            probe = center + np.array([
+                ROBOT_START_CLEARANCE_RADIUS * np.cos(angle),
+                ROBOT_START_CLEARANCE_RADIUS * np.sin(angle),
+                0.0,
+            ], dtype=float)
+            walkable = self._closest_walkable_point(probe)
+            if walkable is None:
+                return False, float("inf")
+            projection_error = np.linalg.norm(walkable[:2] - probe[:2])
+            max_projection_error = max(max_projection_error, projection_error)
+            if projection_error > ROBOT_START_CLEARANCE_MAX_PROJECTION:
+                return False, max_projection_error
+        return True, max_projection_error
+
+    def _format_distance(self, distance):
+        if distance is None:
+            return "unavailable"
+        return f"{distance:.2f} m"
+
+    def _direct_robot_start_near_cube(self):
+        distance = random.uniform(
+            ROBOT_START_MIN_DISTANCE_FROM_CUBE,
+            ROBOT_START_MAX_DISTANCE_FROM_CUBE,
+        )
+        angle = random.uniform(-np.pi, np.pi)
+        return np.array([
+            self._cube_position[0] + distance * np.cos(angle),
+            self._cube_position[1] + distance * np.sin(angle),
+            0.0,
+        ], dtype=float)
+
     def _reset_state_machine(self):
         self._state = PickPlaceState.NAVIGATE_TO_PICK
         if self._pick_goal_pos is None:
@@ -335,10 +884,14 @@ class HelloWorld(BaseSample):
         if self._state == PickPlaceState.NAVIGATE_TO_PICK:
             if self._navigate_path_step(self._pick_goal_pos):
                 self._stop_wheels()
-                self._state = PickPlaceState.FACE_CUBE
+                if ENABLE_FACE_TARGET_STATES:
+                    self._state = PickPlaceState.FACE_CUBE
+                else:
+                    self._settle_count = 0
+                    self._state = PickPlaceState.SETTLE
 
         elif self._state == PickPlaceState.FACE_CUBE:
-            if self._face_target_step(cube_position, "pick"):
+            if self._face_target_step(self._get_current_cube_position(), "pick"):
                 self._stop_wheels()
                 self._settle_count = 0
                 self._state = PickPlaceState.SETTLE
@@ -353,15 +906,6 @@ class HelloWorld(BaseSample):
         elif self._state == PickPlaceState.GRASP_SEQUENCE:
             if self._run_arm_sequence():
                 self._holding_object = True
-                lift_target = cube_position + \
-                    np.array([0.0, 0.0, self.lift_height])
-                self._arm_segments = [ArmSegment(
-                    lift_target, self.gripper_closed, settle_steps=20)]
-                self._active_segment = None
-                self._state = PickPlaceState.LIFT
-
-        elif self._state == PickPlaceState.LIFT:
-            if self._run_arm_sequence():
                 self._prepare_post_lift_x_adjust_sequence()
                 self._state = PickPlaceState.ADJUST_ARM_X
 
@@ -378,11 +922,15 @@ class HelloWorld(BaseSample):
             self._close_gripper()
             if self._navigate_path_step(self._place_goal_pos):
                 self._stop_wheels()
-                self._state = PickPlaceState.FACE_PLACE
+                if ENABLE_FACE_TARGET_STATES:
+                    self._state = PickPlaceState.FACE_PLACE
+                else:
+                    self._prepare_place_sequence()
+                    self._state = PickPlaceState.PLACE_RELEASE
 
         elif self._state == PickPlaceState.FACE_PLACE:
             self._close_gripper()
-            if self._face_target_step(place_cube_pos, "place"):
+            if self._face_target_step(self._place_cube_pos, "place"):
                 self._stop_wheels()
                 self._prepare_place_sequence()
                 self._state = PickPlaceState.PLACE_RELEASE
@@ -540,10 +1088,10 @@ class HelloWorld(BaseSample):
         return []
 
     def _resolve_pick_goal_pos(self):
-        return self._resolve_walkable_goal_pos(cube_position, "pick")
+        return self._resolve_walkable_goal_pos(self._cube_position, "pick")
 
     def _resolve_place_goal_pos(self):
-        return self._resolve_walkable_goal_pos(place_cube_pos, "place")
+        return self._resolve_walkable_goal_pos(self._place_cube_pos, "place")
 
     def _resolve_walkable_goal_pos(self, target_pos, label):
         fallback = np.array([target_pos[0], target_pos[1], 0.0], dtype=float)
@@ -735,20 +1283,90 @@ class HelloWorld(BaseSample):
     # ------------------------------------------------------------------
     # Arm and gripper state execution
     # ------------------------------------------------------------------
+    def _get_current_cube_position(self, log_fail=False):
+        if self._cube is None:
+            return self._cube_position.copy()
+
+        try:
+            position, _ = self._cube.get_world_pose()
+            position = np.asarray(position, dtype=float)
+            self._cube_position = position.copy()
+            return position
+        except Exception as exc:
+            if log_fail:
+                carb.log_warn(
+                    f"[Cube] Could not read current cube pose; using last known position {self._cube_position.tolist()}. Details: {exc}")
+            return self._cube_position.copy()
+
     def _prepare_grasp_sequence(self):
-        pre_grasp = cube_position + np.array([0.0, 0.0, self.pre_grasp_height])
-        grasp = cube_position + np.array([0.0, 0.0, self.grasp_height_offset])
-        self._arm_segments = [
-            ArmSegment(pre_grasp, self.gripper_open, settle_steps=45),
-            ArmSegment(grasp, self.gripper_open, settle_steps=10),
-            ArmSegment(grasp, self.gripper_closed, settle_steps=45),
-        ]
+        cube_pos = self._get_current_cube_position(log_fail=True)
+        carb.log_info(
+            f"[Cube] Preparing grasp using current cube position {cube_pos.tolist()}.")
+
+        pre_grasp = cube_pos + np.array([0.0, 0.0, self.pre_grasp_height])
+        grasp = cube_pos + np.array([0.0, 0.0, self.grasp_height_offset])
+
+        current_joints = None
+        if self._arm_subset is not None:
+            try:
+                current_joints = self._arm_subset.get_joint_positions()
+            except Exception as exc:
+                carb.log_warn(
+                    f"[Arm] Could not read current arm joints before grasp: {exc}")
+
+        self._arm_segments = []
+        if current_joints is not None:
+            self._arm_segments.append(
+                ArmSegment(
+                    None,
+                    self.gripper_open,
+                    settle_steps=self.fetch_open_settle_steps,
+                    target_joints=current_joints,
+                    label="open_gripper_before_fetch",
+                    trajectory_steps=1,
+                )
+            )
+
+        self._arm_segments.extend([
+            ArmSegment(
+                pre_grasp,
+                self.gripper_open,
+                settle_steps=self.fetch_pre_grasp_settle_steps,
+                ee_tolerance=0.04,
+                label="move_to_pre_grasp_above_cube",
+                trajectory_steps=self.fetch_pre_grasp_move_steps,
+            ),
+            ArmSegment(
+                grasp,
+                self.gripper_open,
+                settle_steps=self.fetch_descent_settle_steps,
+                ee_tolerance=0.035,
+                label="descend_to_grasp_cube",
+                trajectory_steps=self.fetch_descent_move_steps,
+            ),
+            ArmSegment(
+                grasp,
+                self.gripper_closed,
+                settle_steps=self.fetch_close_settle_steps,
+                ee_tolerance=0.035,
+                label="close_gripper_on_cube",
+                trajectory_steps=1,
+            ),
+            ArmSegment(
+                pre_grasp,
+                self.gripper_closed,
+                settle_steps=self.fetch_lift_settle_steps,
+                ee_tolerance=0.04,
+                label="lift_object_to_pre_grasp",
+                trajectory_steps=self.fetch_lift_move_steps,
+            ),
+        ])
         self._active_segment = None
 
     def _prepare_place_sequence(self):
-        place_above = place_cube_pos + \
+        place_above = self._place_cube_pos + \
             np.array([0.0, 0.0, self.pre_grasp_height])
-        place = place_cube_pos + np.array([0.0, 0.0, 0.045])
+        place = self._place_cube_pos + np.array([0.0, 0.0, 0.045])
         self._arm_segments = [
             ArmSegment(place_above, self.gripper_closed, settle_steps=20),
             ArmSegment(place, self.gripper_closed, settle_steps=20),
@@ -787,6 +1405,22 @@ class HelloWorld(BaseSample):
         if not segment.ik_solved:
             return False
 
+        if segment.target_pos is not None and not self._ee_position_reached(segment.target_pos, segment.ee_tolerance):
+            if segment.trajectory:
+                self._arm_subset.apply_action(
+                    joint_positions=segment.trajectory[-1])
+            segment.reach_waited += 1
+            if segment.reach_waited == 1 or segment.reach_waited % 60 == 0:
+                ee_pos, _ = self._ee_prim.get_world_pose()
+                error = np.linalg.norm(
+                    np.asarray(ee_pos, dtype=float) - segment.target_pos)
+                # carb.log_warn(
+                #     f"[Arm] Waiting for {segment.label} to reach target; error {error:.3f} m.")
+            if segment.reach_waited < segment.reach_timeout_steps:
+                return False
+            # carb.log_warn(
+            #     f"[Arm] Continuing after timeout waiting for {segment.label}; target may not be reached.")
+
         segment.waited += 1
         if segment.waited >= segment.settle_steps:
             self._active_segment = None
@@ -805,12 +1439,18 @@ class HelloWorld(BaseSample):
                 target_joints = current_joints
             else:
                 segment.ik_solved = True
-        alphas = np.linspace(0.0, 1.0, self.arm_trajectory_steps)
+        trajectory_steps = (
+            self.arm_trajectory_steps
+            if segment.trajectory_steps is None
+            else segment.trajectory_steps
+        )
+        alphas = np.linspace(0.0, 1.0, trajectory_steps)
         smooth = 3.0 * alphas**2 - 2.0 * alphas**3
         segment.trajectory = [current_joints + alpha *
                               (target_joints - current_joints) for alpha in smooth]
         segment.index = 0
         segment.waited = 0
+        segment.reach_waited = 0
 
     def _solve_ik(self, target_pos):
         base_pos, base_quat = self._franka_base_prim.get_world_pose()
